@@ -1,0 +1,10 @@
+.env
+*.env
+data/
+*.csv
+!rents_TEAMNAME.csv
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
+out/
