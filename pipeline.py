@@ -420,11 +420,56 @@ def train_model(train: pd.DataFrame, valid: pd.DataFrame, trials: int = 0,
     return model, feats
 
 
+PREMIUM_WINDOW_DAYS = 730
+BUILDING_BANDS = [(0, 20), (20, 60), (60, 150), (150, 10 ** 6)]
+
+
+def premium_by_building_size(train: pd.DataFrame, fallback: float) -> dict:
+    """
+    The car-space premium measured separately by building size.
+
+    It is not constant: a space is scarce in a small walk-up and standard in a
+    tower with basement parking, so the premium is several times larger in
+    small blocks. A single number would over-price towers and under-price
+    small blocks at the same time.
+    """
+    out = {}
+    if "flats_in_building" not in train.columns or "car_space" not in train.columns:
+        return out
+    t = train.dropna(subset=["car_space", "flats_in_building", "bedrooms"])
+    t = t[t.date >= t.date.max() - pd.Timedelta(days=PREMIUM_WINDOW_DAYS)]
+    for lo, hi in BUILDING_BANDS:
+        part = t[(t.flats_in_building >= lo) & (t.flats_in_building < hi)]
+        if len(part) < 200:
+            continue
+        g = part.groupby(["bedrooms", "car_space"], observed=True).rent.agg(["median", "size"])
+        g = g[g["size"] >= MIN_GROUP]["median"].unstack("car_space")
+        if g.shape[1] < 2:
+            continue
+        gaps = (g[1.0] - g[0.0]).dropna()
+        if len(gaps) >= 2:
+            v = float(gaps.median())
+            out[(lo, hi)] = v if 5.0 <= v <= 400.0 else fallback
+    if out:
+        print("[premium] by building size: " + ", ".join(
+            f"{lo}-{'+' if hi > 10**5 else hi}: ${v:.0f}" for (lo, hi), v in out.items()))
+    return out
+
+
 def empirical_premium(train: pd.DataFrame) -> float:
-    """Median parking gap within suburb x bedrooms groups that have both kinds."""
+    """
+    Median parking gap within suburb x bedrooms groups that have both kinds,
+    measured over recent adverts only. The history runs to 2012 and a gap
+    averaged across all of it understates the current premium badly.
+    """
     if "car_space" not in train:
         return 90.0
     t = train.dropna(subset=["car_space"])
+    recent = t[t.date >= t.date.max() - pd.Timedelta(days=PREMIUM_WINDOW_DAYS)]
+    if len(recent) >= 2000:
+        t = recent
+        print(f"[premium] measured on {len(t):,} adverts from the last "
+              f"{PREMIUM_WINDOW_DAYS}d")
     g = (t.groupby(["suburb", "bedrooms", "car_space"], observed=True)
            .rent.agg(["median", "size"]))
     g = g[g["size"] >= MIN_GROUP]["median"].unstack("car_space")
@@ -442,22 +487,31 @@ def empirical_premium(train: pd.DataFrame) -> float:
     return val
 
 
-def predict_both(model, feats, frame: pd.DataFrame,
-                 emp: float) -> tuple[np.ndarray, np.ndarray]:
+def predict_both(model, feats, frame: pd.DataFrame, emp: float,
+                 by_size: dict | None = None) -> tuple[np.ndarray, np.ndarray]:
     """
     Same flat, parking on and off. LightGBM cannot enforce monotonicity under
-    L1, so the gap is clipped into a band around the empirical premium. This
-    makes rent_with >= rent_without true by construction.
+    L1, so the model's own gap is clipped into a band around the premium
+    measured for that flat's building size. rent_with >= rent_without then
+    holds by construction, and a tower is not given a walk-up's premium.
     """
     a, b = frame.copy(), frame.copy()
     a["car_space"], b["car_space"] = 1.0, 0.0
     with_car = model.predict(a[feats])
     raw = with_car - model.predict(b[feats])
 
-    lo, hi = max(10.0, 0.4 * emp), max(40.0, 2.5 * emp)
-    premium = np.clip(np.nan_to_num(raw, nan=emp), lo, hi)
-    print(f"[premium] applied band ${lo:.0f}-${hi:.0f}; "
-          f"{(raw < lo).mean()*100:.1f}% floored, {(raw > hi).mean()*100:.1f}% capped")
+    anchor = np.full(len(frame), float(emp))
+    if by_size and "flats_in_building" in frame.columns:
+        fib = pd.to_numeric(frame.flats_in_building, errors="coerce").to_numpy()
+        for (lo_b, hi_b), v in by_size.items():
+            anchor[np.where((fib >= lo_b) & (fib < hi_b), True, False)] = v
+
+    lo = np.maximum(10.0, 0.4 * anchor)
+    hi = np.maximum(40.0, 2.5 * anchor)
+    premium = np.clip(np.nan_to_num(raw, nan=float(emp)), lo, hi)
+    print(f"[premium] anchors ${anchor.min():.0f}-${anchor.max():.0f}; "
+          f"{(raw < lo).mean()*100:.1f}% floored, {(raw > hi).mean()*100:.1f}% capped, "
+          f"median applied ${np.median(premium):.0f}")
     return with_car, with_car - premium
 
 
@@ -574,7 +628,11 @@ def main():
         imp = sorted(zip(feats, model.feature_importance("gain")), key=lambda x: -x[1])
         results["top_features"] = [{"feature": f, "gain": round(float(g))} for f, g in imp[:15]]
 
-        w, o = predict_both(model, feats, score_frame, empirical_premium(train))
+        emp = empirical_premium(train)
+        by_size = premium_by_building_size(train, emp)
+        results["parking_premium_by_building_size"] = {
+            f"{lo}-{'plus' if hi > 10**5 else hi}": round(v) for (lo, hi), v in by_size.items()}
+        w, o = predict_both(model, feats, score_frame, emp, by_size)
 
         # the submission is scored on 1 Aug - 30 Sep, so extrapolate to its midpoint
         horizon_sub = (SCORE_MIDPOINT - CUTOFF).days
