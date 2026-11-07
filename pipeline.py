@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -119,6 +120,44 @@ def load_leases() -> tuple[pd.DataFrame, dict]:
     return df, m
 
 
+def merge_extras(inp: pd.DataFrame, path: Path | None) -> pd.DataFrame:
+    """
+    Fold in enrich.py's output: parsed floors, a car-space probability and
+    block figures for addresses outside the supplied block file.
+
+    It is built from static address fields only - no dates, no rents - so it
+    cannot carry anything from after the cutoff into the model.
+    """
+    if path is None or not Path(path).exists():
+        return inp
+    ex = pd.read_csv(path, dtype={"gnaf_id": str})
+    bad = [c for c in ex.columns if re.search(r"rent|date|listed|seen", c, re.I)]
+    if bad:
+        print(f"[extras] !! refusing {path}: suspicious columns {bad}")
+        return inp
+    before = len(inp)
+    inp = inp.merge(ex, on="gnaf_id", how="left", suffixes=("", "_ex"))
+    assert len(inp) == before, "extras changed the row count"
+
+    if "floor_est" in inp.columns:
+        have = inp.floor_level.notna().mean() if "floor_level" in inp else 0
+        inp["floor_level"] = pd.to_numeric(inp.get("floor_level"), errors="coerce").fillna(
+            pd.to_numeric(inp.floor_est, errors="coerce"))
+        print(f"[extras] floor known {have*100:.1f}% -> {inp.floor_level.notna().mean()*100:.1f}%")
+    for src, dst in (("block_homes_filled", "block_homes_2026"),
+                     ("block_new_homes_filled", "block_new_homes_2021_2026")):
+        if src in inp.columns and dst in inp.columns:
+            inp[dst] = pd.to_numeric(inp[dst], errors="coerce").fillna(
+                pd.to_numeric(inp[src], errors="coerce"))
+    # car_space_prob is deliberately NOT used as a feature: predict_both flips
+    # car_space on and off, and a probability that does not flip with it gives
+    # the model contradictory signals and collapses the measured premium.
+    if "car_space_prob" in inp.columns:
+        inp = inp.drop(columns=["car_space_prob"])
+        print("[extras] car_space_prob dropped - it would break the parking counterfactual")
+    return inp
+
+
 def load_blocks() -> pd.DataFrame | None:
     if not BLOCKS_FILE.exists():
         return None
@@ -176,7 +215,7 @@ def add_features(df: pd.DataFrame, ref_date_col: str | None) -> pd.DataFrame:
 
     for c in ("bedrooms", "bathrooms", "car_space", "car_spaces", "floor_level",
               "flats_in_building", "block_new_homes_2021_2026", "block_homes_2026",
-              "latitude", "longitude", "ever_advertised_for_lease"):
+              "latitude", "longitude", "ever_advertised_for_lease", "car_space_prob"):
         if c in df:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
@@ -563,9 +602,11 @@ def main():
                     help="recency weight half-life in days; large = no weighting")
     ap.add_argument("--no-drift", action="store_true", help="disable forward extrapolation")
     ap.add_argument("--no-calib", action="store_true", help="disable median shift")
+    ap.add_argument("--extras", type=Path, default=None,
+                    help="enrich.py output to merge, e.g. out/extras.csv")
     args = ap.parse_args()
 
-    inp = load_input()
+    inp = merge_extras(load_input(), args.extras)
     leases, _ = load_leases()
     blocks = load_blocks()
 

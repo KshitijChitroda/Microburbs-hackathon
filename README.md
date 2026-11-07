@@ -28,12 +28,12 @@ Held out: adverts dated 2026-05-01 to 2026-07-31, never used to build or tune.
 
 | Estimator | Typical miss | Within $100 |
 |---|---|---|
-| **Our estimate** | **$58.03** | **71.08%** |
+| **Our estimate** | **$57.27** | **70.76%** |
 | Microburbs rental valuation (published) | $86 | 55.21% |
 | Our group-median baseline | $100 | 56.87% |
 | Microburbs simple estimate (published) | $100 | — |
 
-R squared **0.8021** on 4,083 held-out adverts. Our typical
+R squared **0.7995** on 4,083 held-out adverts. Our typical
 miss is **33% smaller** than the published figure for their own valuation.
 
 Our baseline reproduces their published $100 / 56% almost exactly, which is why we
