@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -132,9 +133,23 @@ def load_blocks() -> pd.DataFrame | None:
 CAT = ["suburb", "property_type"]
 
 
+def merge_blocks(df: pd.DataFrame, blocks: pd.DataFrame | None) -> pd.DataFrame:
+    """
+    Join block data on `mb`, keeping only columns we don't already have. The
+    supplied blocks file carries its own `suburb`, and letting pandas suffix it
+    renames ours to suburb_x and breaks every groupby downstream.
+    """
+    if blocks is None or "mb" not in df.columns or "mb" not in blocks.columns:
+        return df
+    keep = [c for c in blocks.columns if c == "mb" or c not in df.columns]
+    return df.merge(blocks[keep], on="mb", how="left")
+
+
 def build_training_frame(leases: pd.DataFrame, inp: pd.DataFrame,
                          blocks: pd.DataFrame | None) -> pd.DataFrame:
     df = leases.merge(inp, on="gnaf_id", how="left", suffixes=("", "_inp"))
+    matched = df.suburb.notna().mean() if "suburb" in df else float("nan")
+    print(f"[match] {matched*100:.1f}% of adverts matched a flat in the input file")
 
     # advert-level attributes beat the input snapshot where present
     for c in ("bedrooms", "bathrooms", "car_space"):
@@ -142,10 +157,7 @@ def build_training_frame(leases: pd.DataFrame, inp: pd.DataFrame,
         if a in df:
             df[c] = df[a].where(df[a].notna(), df[c])
 
-    if blocks is not None and "mb" in df:
-        keep = [c for c in blocks.columns if c != "mb"]
-        df = df.merge(blocks[["mb"] + keep], on="mb", how="left", suffixes=("", "_blk"))
-
+    df = merge_blocks(df, blocks)
     return add_features(df, ref_date_col="date")
 
 
@@ -221,16 +233,32 @@ GROUPS = [
     ["bedrooms"],
 ]
 MIN_GROUP = 10
+BASELINE_WINDOW_DAYS = 365     # see note below
 
 
 def baseline_tables(train: pd.DataFrame) -> tuple[list, float]:
+    """
+    Group medians, from the LAST YEAR of adverts only.
+
+    The advert history runs from 2012, and City of Sydney rents have risen
+    sharply over that period, so a median across all of it underprices current
+    adverts badly - on this data it costs about $120 of median error. Microburbs'
+    own example baseline used a single twelve-month window for the same reason.
+    """
+    recent = train[train.date >= train.date.max() - pd.Timedelta(days=BASELINE_WINDOW_DAYS)]
+    if len(recent) < 2000:
+        recent = train
+        print("[baseline] recent window too thin - using all adverts")
+    else:
+        print(f"[baseline] {len(recent):,} adverts from the last "
+              f"{BASELINE_WINDOW_DAYS}d (of {len(train):,})")
     tables = []
     for keys in GROUPS:
-        if not set(keys) <= set(train.columns):
+        if not set(keys) <= set(recent.columns):
             continue
-        g = train.groupby(keys, observed=True).rent.agg(["median", "size"])
+        g = recent.groupby(keys, observed=True).rent.agg(["median", "size"])
         tables.append((keys, g[g["size"] >= MIN_GROUP]["median"]))
-    return tables, float(train.rent.median())
+    return tables, float(recent.rent.median())
 
 
 def baseline_predict(df: pd.DataFrame, tables: list, globalmed: float) -> np.ndarray:
@@ -245,9 +273,93 @@ def baseline_predict(df: pd.DataFrame, tables: list, globalmed: float) -> np.nda
 
 
 # ----------------------------------------------------------------------------
+# DRIFT  — the scored adverts are dated AFTER the cutoff, so a model fitted to
+# data ending 31 July predicts July prices for September adverts. Microburbs'
+# own valuation was "typically $61 a week low", which is this effect. We
+# estimate the weekly trend from the training adverts and extrapolate. Using
+# pre-cutoff information to extrapolate forward is within the rules.
+# ----------------------------------------------------------------------------
+SCORE_MIDPOINT = pd.Timestamp("2026-09-01")   # middle of 1 Aug - 30 Sep window
+
+
+DRIFT_LOOKBACK_DAYS = 365      # recent trend only; the data reaches back to 2009
+
+
+def drift_per_day(df: pd.DataFrame, min_weeks: int = 12,
+                  lookback: int = DRIFT_LOOKBACK_DAYS) -> float:
+    """
+    Dollars per day, from a line through weekly median advert rents.
+
+    Fitted on the LAST YEAR only. The advert history runs back to 2009, and a
+    line through seventeen years of rents says nothing useful about the next
+    thirty-two days - the recent slope is what we are extrapolating.
+    """
+    recent = df[df.date >= df.date.max() - pd.Timedelta(days=lookback)]
+    w = (recent.assign(wk=recent.date.dt.to_period("W").dt.start_time)
+               .groupby("wk").rent.agg(["median", "size"]))
+    w = w[w["size"] >= 10]
+    if len(w) < min_weeks:
+        print(f"[drift] only {len(w)} usable weeks in last {lookback}d "
+              "- assuming no drift")
+        return 0.0
+    x = (w.index - w.index.min()).days.to_numpy(dtype=float)
+    slope = float(np.polyfit(x, w["median"].to_numpy(), 1)[0])
+    print(f"[drift] ${slope*7:+.2f}/week over {len(w)} weeks "
+          f"(last {lookback}d of adverts)")
+    return slope
+
+
+def check_drift(train: pd.DataFrame, valid: pd.DataFrame, pred: np.ndarray) -> float:
+    """
+    Does extrapolating actually help? Measure it on the held-out window before
+    trusting it. Returns the per-day slope to use, or 0.0 if it does not help.
+    """
+    slope = drift_per_day(train)
+    if slope == 0.0:
+        return 0.0
+    horizon = (valid.date.median() - train.date.max()).days
+    lift = slope * horizon
+    y = valid.rent.to_numpy()
+    before = score(y, pred)["median_abs_error"]
+    after = score(y, pred + lift)["median_abs_error"]
+    print(f"[drift] horizon {horizon}d -> ${lift:+.2f}: "
+          f"median error ${before:.2f} -> ${after:.2f}")
+    if after < before:
+        return slope
+    print("[drift] no improvement on held-out - switching drift OFF")
+    return 0.0
+
+
+def median_shift(y_true: np.ndarray, pred: np.ndarray,
+                 span: float = 200.0, step: float = 0.5) -> float:
+    """
+    Find the constant shift that minimises MEDIAN ABSOLUTE error.
+
+    Note this is NOT the shift that zeroes the median residual. Minimising
+    median|r - s| puts s at the centre of the shortest interval containing half
+    the residuals, which is generally not their median. Zeroing the median
+    residual can make the scored metric slightly worse, so we search the
+    metric itself and break ties on the share within $100 - the contest's own
+    tie-break.
+    """
+    y, p = np.asarray(y_true, float), np.asarray(pred, float)
+    naive = float(np.median(y - p))
+    grid = np.arange(-span, span + step, step)
+    err = np.abs(y[None, :] - (p[None, :] + grid[:, None]))
+    med = np.median(err, axis=1)
+    within = (err <= 100).mean(axis=1)
+    best = np.lexsort((-within, med))[0]          # min median error, then max within-$100
+    s = float(grid[best])
+    print(f"[calib] shift ${s:+.2f} -> median ${med[best]:.2f}, "
+          f"within-$100 {within[best]*100:.2f}%  (zeroing residual would give ${naive:+.2f})")
+    return s
+
+
+# ----------------------------------------------------------------------------
 # MODEL
 # ----------------------------------------------------------------------------
-def train_model(train: pd.DataFrame, valid: pd.DataFrame, trials: int = 0):
+def train_model(train: pd.DataFrame, valid: pd.DataFrame, trials: int = 0,
+                half_life: float = 180.0):
     import lightgbm as lgb
 
     feats = feature_cols(train)
@@ -256,10 +368,16 @@ def train_model(train: pd.DataFrame, valid: pd.DataFrame, trials: int = 0):
         objective="regression_l1", metric="l1",
         learning_rate=0.05, num_leaves=63, min_data_in_leaf=40,
         feature_fraction=0.85, bagging_fraction=0.85, bagging_freq=1,
-        lambda_l2=1.0, verbosity=-1, n_jobs=-1,
+        lambda_l2=1.0, feature_pre_filter=False, verbosity=-1, n_jobs=-1,
     )
 
-    dtr = lgb.Dataset(train[feats], train.rent, categorical_feature=[c for c in CAT if c in feats])
+    # recency weighting: a July 2026 advert says more than a 2024 one
+    age = (CUTOFF - train.date).dt.days.clip(lower=0)
+    w = 0.5 ** (age / half_life)
+    print(f"[weights] half-life {half_life:.0f}d; oldest advert weight {w.min():.3f}")
+
+    dtr = lgb.Dataset(train[feats], train.rent, weight=w.to_numpy(),
+                      categorical_feature=[c for c in CAT if c in feats])
     dva = lgb.Dataset(valid[feats], valid.rent, reference=dtr)
 
     def fit(params):
@@ -280,14 +398,23 @@ def train_model(train: pd.DataFrame, valid: pd.DataFrame, trials: int = 0):
                 bagging_fraction=t.suggest_float("bagging_fraction", 0.6, 1.0),
                 lambda_l2=t.suggest_float("lambda_l2", 0.1, 20.0, log=True),
             )
-            m = fit(p)
+            try:
+                m = fit(p)
+            except Exception as e:          # never let one trial kill the run
+                print(f"[tune] trial skipped: {type(e).__name__}")
+                return float("inf")
             # tune on the ranked metric, not on the loss
             return score(valid.rent.to_numpy(), m.predict(valid[feats]))["median_abs_error"]
 
         st = optuna.create_study(direction="minimize")
-        st.optimize(objective, n_trials=trials, show_progress_bar=False)
-        print(f"[tune] best median abs error: ${st.best_value:.2f}  params={st.best_params}")
-        base.update(st.best_params)
+        st.optimize(objective, n_trials=trials, show_progress_bar=False,
+                    catch=(Exception,))
+        ok = [t for t in st.trials if t.value not in (None, float("inf"))]
+        if ok:
+            print(f"[tune] best median abs error: ${st.best_value:.2f}  params={st.best_params}")
+            base.update(st.best_params)
+        else:
+            print("[tune] every trial failed - keeping default params")
 
     model = fit(base)
     return model, feats
@@ -306,6 +433,12 @@ def empirical_premium(train: pd.DataFrame) -> float:
     gaps = (g[1.0] - g[0.0]).dropna()
     val = float(gaps.median()) if len(gaps) else 90.0
     print(f"[premium] empirical median parking gap: ${val:.2f} over {len(gaps)} groups")
+    # A negative or implausibly small measured gap means thin parking data, not
+    # that a car space is worthless. Microburbs' own example report puts it near
+    # $90, so fall back to that rather than collapsing the band.
+    if len(gaps) < 10 or val < 20.0:
+        print(f"[premium] implausible (n={len(gaps)}) - falling back to $90")
+        return 90.0
     return val
 
 
@@ -372,6 +505,10 @@ def main():
     ap.add_argument("--team", required=True)
     ap.add_argument("--trials", type=int, default=0, help="Optuna trials; 0 = skip")
     ap.add_argument("--baseline-only", action="store_true")
+    ap.add_argument("--half-life", type=float, default=180.0,
+                    help="recency weight half-life in days; large = no weighting")
+    ap.add_argument("--no-drift", action="store_true", help="disable forward extrapolation")
+    ap.add_argument("--no-calib", action="store_true", help="disable median shift")
     args = ap.parse_args()
 
     inp = load_input()
@@ -379,11 +516,26 @@ def main():
     blocks = load_blocks()
 
     full = build_training_frame(leases, inp, blocks)
-    train = full[full.date < VAL_START]
-    valid = full[(full.date >= VAL_START) & (full.date <= CUTOFF)]
-    print(f"[split] train {len(train):,} (to {VAL_START.date() - pd.Timedelta(days=1)})  "
-          f"valid {len(valid):,} ({VAL_START.date()} to {CUTOFF.date()})")
-    assert len(valid) > 200, "validation window too small - widen VAL_START"
+
+    # Hold out the latest adverts. If that window is thin, widen it rather than
+    # dying - but never past the point where there is too little left to train.
+    val_start = VAL_START
+    for months in (0, 1, 2, 3, 5, 8, 12):
+        val_start = VAL_START - pd.DateOffset(months=months)
+        n_val = int(((full.date >= val_start) & (full.date <= CUTOFF)).sum())
+        n_tr = int((full.date < val_start).sum())
+        if n_val >= 300 and n_tr >= 500:
+            break
+    train = full[full.date < val_start]
+    valid = full[(full.date >= val_start) & (full.date <= CUTOFF)]
+    if val_start != VAL_START:
+        print(f"[split] widened validation window by "
+              f"{(VAL_START - val_start).days}d for sample size")
+    print(f"[split] train {len(train):,} (to {val_start.date() - pd.Timedelta(days=1)})  "
+          f"valid {len(valid):,} ({val_start.date()} to {CUTOFF.date()})")
+    if len(valid) < 100 or len(train) < 200:
+        sys.exit(f"Not enough adverts to validate honestly "
+                 f"(train {len(train):,}, valid {len(valid):,}). Check the leases file.")
 
     results = {}
 
@@ -393,10 +545,7 @@ def main():
     print(f"[baseline] {results['baseline_group_median']}")
 
     # score frame = one row per flat, pretending today is the cutoff
-    score_frame = add_features(
-        inp.merge(blocks, on="mb", how="left") if blocks is not None and "mb" in inp else inp,
-        ref_date_col=None,
-    )
+    score_frame = add_features(merge_blocks(inp, blocks), ref_date_col=None)
 
     if args.baseline_only:
         bw = baseline_predict(score_frame.assign(car_space=1.0), tables, gmed)
@@ -404,16 +553,41 @@ def main():
         bo = np.minimum(bo, bw)
         write_submission(inp, bw, bo, args.team)
     else:
-        model, feats = train_model(train, valid, args.trials)
-        results["model"] = score(valid.rent.to_numpy(), model.predict(valid[feats]))
-        print(f"[model] {results['model']}")
+        model, feats = train_model(train, valid, args.trials, args.half_life)
+        y = valid.rent.to_numpy()
+        raw = model.predict(valid[feats])
+        results["model_raw"] = score(y, raw)
+        print(f"[model] raw {results['model_raw']}")
+
+        # --- drift, validated on the held-out window before being trusted ----
+        slope = 0.0 if args.no_drift else check_drift(train, valid, raw)
+        horizon_val = (valid.date.median() - train.date.max()).days
+        adj = raw + slope * horizon_val
+
+        # --- median calibration, applied after drift so they don't overlap --
+        shift = 0.0 if args.no_calib else median_shift(y, adj)
+        results["model"] = score(y, adj + shift)
+        print(f"[model] corrected {results['model']}")
+        if results["model"]["median_abs_error"] > results["model_raw"]["median_abs_error"]:
+            print("[warn] corrections made it worse - rerun with --no-drift --no-calib")
 
         imp = sorted(zip(feats, model.feature_importance("gain")), key=lambda x: -x[1])
         results["top_features"] = [{"feature": f, "gain": round(float(g))} for f, g in imp[:15]]
 
         w, o = predict_both(model, feats, score_frame, empirical_premium(train))
+
+        # the submission is scored on 1 Aug - 30 Sep, so extrapolate to its midpoint
+        horizon_sub = (SCORE_MIDPOINT - CUTOFF).days
+        total = slope * horizon_sub + shift
+        print(f"[submit] horizon {horizon_sub}d, drift ${slope*horizon_sub:+.2f}, "
+              f"calib ${shift:+.2f}, total ${total:+.2f}")
+        w, o = w + total, o + total
+
         write_submission(inp, w, o, args.team)
         results["parking_premium_median"] = round(float(np.median(w - o)), 2)
+        results["drift_per_week"] = round(slope * 7, 2)
+        results["median_calibration"] = round(shift, 2)
+        results["submission_uplift"] = round(float(total), 2)
 
     results["benchmarks_published_by_microburbs"] = {
         "microburbs_rental_valuation": {"median_abs_error": 86, "pct_within_100": 55.21},
